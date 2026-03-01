@@ -1,149 +1,93 @@
 import os
 import json
+import numpy as np
 from google import genai
 from google.genai import types
+from pinecone import Pinecone
+from lime.lime_text import LimeTextExplainer
 from dotenv import load_dotenv
 
-# Import your real database manager
-from database_manager import DoxuFiDatabase
+# Your local modules
+import risk_analysis.calc_risk as risk_calc
+import risk_analysis.viz as viz
 
 load_dotenv()
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
 MODEL_ID = "gemini-2.5-flash"
+INDEX_NAME = "integrated-sparse-py"
 
-# 1. Initialize the Database
-db = DoxuFiDatabase()
+# Connect to the existing index
+index = pc.Index(INDEX_NAME)
 
-# --- THE TOOLS ---
+# --- XAI LOGIC ---
 
-def query_contract_database(query_text: str) -> str:
-    """
-    Searches the real contract PDF for clauses related to the user's query.
-    Use this whenever you need factual information from the uploaded document.
-    """
-    print(f"DEBUG: Searching database for: '{query_text}'")
+def get_risk_probs(text_list):
+    """Bridge for LIME to talk to your 60+ Red Flag dictionary."""
+    results = []
+    for text in text_list:
+        score = risk_calc.calculate_risk_score(text)['risk_score'] / 100.0
+        results.append([1 - score, score])
+    return np.array(results)
+
+# --- TOOLS ---
+
+def fetch_legal_context(query_text: str) -> str:
+    """Searches Pinecone Sparse Index for exact legal matches."""
+    # Note: Using .search() for Integrated Sparse models
+    results = index.search(
+        project={"field_map": {"text": "chunk_text"}},
+        inputs={"text": query_text},
+        top_k=2
+    )
+    # Extract text from metadata
+    matches = [res['metadata']['chunk_text'] for res in results['matches']]
+    return "\n---\n".join(matches)
+
+def run_deep_xai_analysis(snippet: str):
+    """Generates LIME chart and 1-2 sentence risk explanation."""
+    explainer = LimeTextExplainer(class_names=['Safe', 'Risky'])
+    exp = explainer.explain_instance(snippet, get_risk_probs, num_features=5)
     
-    # Call the query method from our DoxuFiDatabase class
-    search_results = db.query(query_text, n_results=2)
+    # Trigger Matplotlib Chart
+    viz.plot_explanation(exp.as_list())
     
-    # Join the retrieved chunks into a single string for the AI to read
-    context = "\n---\n".join(search_results)
-    return context
+    # 1-2 Sentence Narrative
+    top_words = [word for word, score in exp.as_list() if score > 0.15]
+    prompt = f"""
+        Explain in 2 sentences why these words make a contract risky: {top_words}. Context: {snippet}
+        Write a 1-2 sentence professional explanation for a legal client explaining why these specific words increase the contract's risk.
+        """
+    narrative = client.models.generate_content(model=MODEL_ID, contents=prompt)
+    
+    return f"XAI REPORT: {narrative.text}\nFlagged Keywords: {top_words}"
 
-def explain_simply(legal_text: str) -> str:
-    """
-    Simplifies complex legal text into everyday English.
-    """
-    prompt = f"Explain this legal clause in simple terms for a non-lawyer: {legal_text}"
-    response = client.models.generate_content(model=MODEL_ID, contents=prompt)
-    return response.text
+# --- THE AGENT ---
 
-# --- THE AGENT LOOP ---
+def run_docky_agent(json_input: str):
+    data = json.loads(json_input)
+    query = data.get("question", "")
 
-def run_doxufi_agent(user_json: str):
-    data = json.loads(user_json)
-    user_query = data.get("question", "")
-
-    # Define the toolset for the agent
-    tools_list = [query_contract_database, explain_simply]
+    # Define toolset for the agent
+    def analyze_risk(query_str: str):
+        context = fetch_legal_context(query_str)
+        return run_deep_xai_analysis(context)
 
     chat = client.chats.create(
         model=MODEL_ID,
         config=types.GenerateContentConfig(
-            tools=tools_list,
+            tools=[fetch_legal_context, analyze_risk],
             system_instruction=(
-                "You are Docky, the DoxuFi AI legal assistant. You have access to a real vector database "
-                "containing a legal contract. Always search the database before answering."
-                "Use the provided tools to help users understand their contracts. "
-                "Be professional, but explain things clearly. "
+                "You are Docky. Use 'fetch_legal_context' for facts. "
+                "Use 'analyze_risk' for safety/risk questions to trigger XAI charts."
             )
         )
     )
 
-    print(f"\n--- Docky is analyzing the document... ---")
-    response = chat.send_message(user_query)
-    
-    print(f"\nFINAL ANSWER:\n{response.text}")
+    print(f"--- Docky is working on: {query} ---")
+    response = chat.send_message(query)
+    print(f"\nFINAL RESPONSE:\n{response.text}")
 
 if __name__ == "__main__":
-    
-    test_request = json.dumps({"question": "What does this contract say about liability and explain it simply?"})
-    run_doxufi_agent(test_request)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    # # agent.py
-# import os
-# import json
-# from google import genai
-# from google.genai import types
-# from dotenv import load_dotenv
-# import tools 
-
-# load_dotenv()
-# client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-# MODEL_ID = "gemini-2.5-flash"
-
-# # Note: We use a lambda or a wrapper to pass the 'client' into the simplify tool
-# def run_doxufi_agent(json_input: str):
-#     # Parse the JSON string
-#     try:
-#         data = json.loads(json_input)
-#         user_query = data.get("question", "")
-#     except json.JSONDecodeError:
-#         return "Error: Invalid JSON input."
-
-#     print(f"\n--- Docky is processing: '{user_query}' ---")
-    
-#     # Define tools within the function to keep 'client' in scope
-#     def simplify_wrapper(complex_text: str):
-#         return tools.simplify_legalese(complex_text, client)
-
-#     tools_list = [
-#         tools.query_vector_db, 
-#         tools.extract_entities, 
-#         tools.check_missing_clauses,
-#         tools.get_xai_explanation,
-#         simplify_wrapper # Wrapper that has the LLM client
-#     ]
-
-#     chat = client.chats.create(
-#         model=MODEL_ID,
-#         config=types.GenerateContentConfig(
-#             tools=tools_list,
-#             system_instruction=(
-#                 "You are Docky, the DoxuFi AI legal assistant. "
-#                 "Use the provided tools to help users understand their contracts. "
-#                 "Be professional, but explain things clearly. If a clause is missing, "
-#                 "warn the user. Always use tools to get facts before answering."
-#             )
-#         )
-#     )
-
-#     response = chat.send_message(user_query)
-#     print(f"\nDOCKY'S RESPONSE:\n{response.text}")
-
-# if __name__ == "__main__":
-#     # Simulating a JSON object coming from a frontend/API
-#     mock_json_request = json.dumps({
-#         "question": "What is the liability, and can you explain it simply?",
-#         "user_id": "12345",
-#         "document_id": "contract_001"
-#     })
-    
-#     run_doxufi_agent(mock_json_request)
-
-
+    test_json = json.dumps({"question": "Explain the risk of the interest rate clauses in this loan."})
+    run_docky_agent(test_json)
